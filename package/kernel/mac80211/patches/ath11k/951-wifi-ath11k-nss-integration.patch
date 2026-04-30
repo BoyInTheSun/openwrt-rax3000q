@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: OpenWrt Developer <developer@openwrt.org>
+Date: Mon, 30 Apr 2025 15:00:00 +0000
+Subject: [PATCH] wifi: ath11k: add NSS WiFi offload integration
+
+Add NSS (Network Subsystem) WiFi offload support to the ath11k driver.
+Introduces ath11k_nss.h and ath11k_nss.c which implement:
+
+  - A registration mechanism so that the qca-nss-clients wifili module
+    can register its operations with ath11k at module load time.
+  - Per-vif NSS state tracked in struct ath11k_vif.
+  - Hooks in add_interface/remove_interface to create and destroy the
+    NSS-accelerated data path for each WiFi interface.
+  - A module parameter (nss_offload) to enable/disable NSS offload at
+    runtime without recompiling.
+
+The design follows the same pattern used by ath10k NSS support:
+qca-nss-clients registers a ops struct via ath11k_nss_register_ops(),
+and ath11k calls into those ops when vifs come up or go down.
+
+Stub inline functions are provided in ath11k_nss.h for the
+!CPTCFG_ATH11K_NSS case so no #ifdefs are needed at call sites.
+
+Signed-off-by: OpenWrt Developer <developer@openwrt.org>
+---
+ drivers/net/wireless/ath/ath11k/core.h   |  10 ++
+ drivers/net/wireless/ath/ath11k/mac.c    |   8 ++
+ drivers/net/wireless/ath/ath11k/nss.c    | 139 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath11k/nss.h    |  97 ++++++++++++++++
+ 4 files changed, 254 insertions(+)
+
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/nss.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2025 OpenWrt.org
++ *
++ * NSS WiFi offload interface for ath11k on Qualcomm IPQ50xx/IPQ60xx/IPQ807x.
++ */
++
++#ifndef ATH11K_NSS_H
++#define ATH11K_NSS_H
++
++#include <linux/types.h>
++#include <linux/skbuff.h>
++
++struct ath11k;
++struct ath11k_vif;
++
++/**
++ * struct ath11k_nss_ops - operations registered by qca-nss-clients/nss_wifili
++ *
++ * The nss_wifili.ko module fills in this structure and passes it to
++ * ath11k_nss_register_ops() when it loads.  ath11k calls these ops
++ * from the vif add/remove paths so that NSS can track the WiFi
++ * interfaces it needs to accelerate.
++ *
++ * @vif_alloc:   Called after a vif has been created and its vdev_id is valid.
++ *               Returns 0 on success, negative errno on failure.
++ * @vif_free:    Called before a vif is destroyed.  Must not sleep.
++ * @tx:          Optional TX fast-path.  If the frame is consumed by NSS,
++ *               return true and ath11k will skip its normal TX path.
++ *               Return false to fall back to the normal path.
++ */
++struct ath11k_nss_ops {
++	int  (*vif_alloc)(struct ath11k *ar, struct ath11k_vif *arvif);
++	void (*vif_free)(struct ath11k *ar, struct ath11k_vif *arvif);
++	bool (*tx)(struct ath11k_vif *arvif, struct sk_buff *skb);
++};
++
++/**
++ * struct ath11k_vif_nss - per-interface NSS state embedded in ath11k_vif
++ * @nss_if_num:  Interface number allocated by nss_wifili (-1 = not allocated)
++ * @active:      true when the NSS interface is fully up
++ */
++struct ath11k_vif_nss {
++	int  nss_if_num;
++	bool active;
++};
++
++#ifdef CPTCFG_ATH11K_NSS
++
++extern bool ath11k_nss_offload;
++
++void ath11k_nss_register_ops(const struct ath11k_nss_ops *ops);
++void ath11k_nss_unregister_ops(void);
++
++int  ath11k_nss_vif_add(struct ath11k *ar, struct ath11k_vif *arvif);
++void ath11k_nss_vif_del(struct ath11k *ar, struct ath11k_vif *arvif);
++bool ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb);
++
++#else  /* !CPTCFG_ATH11K_NSS */
++
++static inline void ath11k_nss_register_ops(const struct ath11k_nss_ops *ops) {}
++static inline void ath11k_nss_unregister_ops(void) {}
++
++static inline int  ath11k_nss_vif_add(struct ath11k *ar,
++				       struct ath11k_vif *arvif)
++{ return 0; }
++
++static inline void ath11k_nss_vif_del(struct ath11k *ar,
++				       struct ath11k_vif *arvif) {}
++
++static inline bool ath11k_nss_tx(struct ath11k_vif *arvif,
++				  struct sk_buff *skb)
++{ return false; }
++
++#endif /* CPTCFG_ATH11K_NSS */
++
++#endif /* ATH11K_NSS_H */
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2025 OpenWrt.org
++ *
++ * NSS WiFi offload integration for ath11k on Qualcomm IPQ50xx/IPQ60xx/IPQ807x.
++ *
++ * This file provides the glue layer between ath11k and the qca-nss-clients
++ * nss_wifili.ko module.  The design is intentionally thin:
++ *
++ *   1. nss_wifili.ko registers a struct ath11k_nss_ops via
++ *      ath11k_nss_register_ops() when it loads.
++ *   2. ath11k calls ath11k_nss_vif_add/del from the mac80211 add/remove
++ *      interface callbacks so that NSS can track each VAP.
++ *   3. For TX, ath11k may call ath11k_nss_tx(); if NSS consumes the frame
++ *      the normal TX path is skipped.
++ *
++ * If nss_wifili is not loaded (ops == NULL) or ath11k_nss_offload is false,
++ * all operations are no-ops and ath11k behaves exactly as without this file.
++ */
++
++#include <linux/module.h>
++#include <linux/spinlock.h>
++#include "core.h"
++#include "debug.h"
++#include "nss.h"
++
++/* Module parameter: set to 0 to disable NSS offload at boot */
++bool ath11k_nss_offload = true;
++module_param_named(nss_offload, ath11k_nss_offload, bool, 0644);
++MODULE_PARM_DESC(nss_offload, "Enable NSS WiFi offload (default: 1)");
++EXPORT_SYMBOL(ath11k_nss_offload);
++
++static DEFINE_SPINLOCK(nss_ops_lock);
++static const struct ath11k_nss_ops *nss_ops;
++
++/**
++ * ath11k_nss_register_ops - register NSS operations from nss_wifili.ko
++ * @ops: pointer to the ops struct provided by qca-nss-clients
++ *
++ * Called by nss_wifili.ko during its module_init().  The pointer is stored
++ * and used by ath11k whenever a new WiFi interface is created or removed.
++ * Pass NULL (via ath11k_nss_unregister_ops) during module_exit().
++ */
++void ath11k_nss_register_ops(const struct ath11k_nss_ops *ops)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nss_ops_lock, flags);
++	nss_ops = ops;
++	spin_unlock_irqrestore(&nss_ops_lock, flags);
++}
++EXPORT_SYMBOL(ath11k_nss_register_ops);
++
++/**
++ * ath11k_nss_unregister_ops - clear the registered NSS operations
++ *
++ * Called by nss_wifili.ko during its module_exit().
++ */
++void ath11k_nss_unregister_ops(void)
++{
++	ath11k_nss_register_ops(NULL);
++}
++EXPORT_SYMBOL(ath11k_nss_unregister_ops);
++
++/**
++ * ath11k_nss_vif_add - notify NSS that a new WiFi interface has been created
++ * @ar:     the ath11k radio the interface belongs to
++ * @arvif:  the new interface
++ *
++ * Called from ath11k_mac_op_add_interface() after the vdev has been
++ * created and started.  Returns 0 on success.
++ */
++int ath11k_nss_vif_add(struct ath11k *ar, struct ath11k_vif *arvif)
++{
++	const struct ath11k_nss_ops *ops;
++	unsigned long flags;
++	int ret = 0;
++
++	arvif->nss.nss_if_num = -1;
++	arvif->nss.active = false;
++
++	if (!ath11k_nss_offload)
++		return 0;
++
++	spin_lock_irqsave(&nss_ops_lock, flags);
++	ops = nss_ops;
++	spin_unlock_irqrestore(&nss_ops_lock, flags);
++
++	if (!ops || !ops->vif_alloc)
++		return 0;
++
++	ret = ops->vif_alloc(ar, arvif);
++	if (ret) {
++		ath11k_warn(ar->ab,
++			    "NSS vif alloc failed for vdev %d: %d\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	arvif->nss.active = true;
++	ath11k_dbg(ar->ab, ATH11K_DBG_MAC,
++		   "NSS vif added for vdev %d (nss_if=%d)\n",
++		   arvif->vdev_id, arvif->nss.nss_if_num);
++	return 0;
++}
++
++/**
++ * ath11k_nss_vif_del - notify NSS that a WiFi interface is being removed
++ * @ar:     the ath11k radio
++ * @arvif:  the interface being removed
++ *
++ * Called from ath11k_mac_op_remove_interface() before the vdev is deleted.
++ */
++void ath11k_nss_vif_del(struct ath11k *ar, struct ath11k_vif *arvif)
++{
++	const struct ath11k_nss_ops *ops;
++	unsigned long flags;
++
++	if (!arvif->nss.active)
++		return;
++
++	spin_lock_irqsave(&nss_ops_lock, flags);
++	ops = nss_ops;
++	spin_unlock_irqrestore(&nss_ops_lock, flags);
++
++	if (ops && ops->vif_free)
++		ops->vif_free(ar, arvif);
++
++	arvif->nss.active = false;
++	arvif->nss.nss_if_num = -1;
++}
++
++/**
++ * ath11k_nss_tx - try to transmit a frame via the NSS fast-path
++ * @arvif: the transmitting interface
++ * @skb:   the frame to transmit
++ *
++ * Returns true if NSS consumed the frame (caller must not free it),
++ * false to fall back to the normal ath11k TX path.
++ */
++bool ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
++{
++	const struct ath11k_nss_ops *ops;
++	unsigned long flags;
++
++	if (!arvif->nss.active || !ath11k_nss_offload)
++		return false;
++
++	spin_lock_irqsave(&nss_ops_lock, flags);
++	ops = nss_ops;
++	spin_unlock_irqrestore(&nss_ops_lock, flags);
++
++	if (!ops || !ops->tx)
++		return false;
++
++	return ops->tx(arvif, skb);
++}
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: BSD-3-Clause-Clear */
+ /*
+  * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2025 OpenWrt.org
+  */
+ 
+ #ifndef ATH11K_CORE_H
+@@ -29,6 +30,7 @@
+ #include "thermal.h"
+ #include "wow.h"
+ #include "fw.h"
++#include "nss.h"
+ 
+ #define SM(_v, _f)	(((_v) << _f##_S) & _f)
+ 
+@@ -374,6 +376,9 @@ struct ath11k_vif {
+ 
+ 	struct ath11k_mgmt_frame_stats mgmt_stats;
+ 	struct dentry *debugfs_twt;
++
++	/* NSS WiFi offload state for this interface */
++	struct ath11k_vif_nss nss;
+ };
+ 
+ struct ath11k_vif_iter {
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -5998,6 +5998,10 @@ static int ath11k_mac_op_add_interface(s
+ 		goto err_vdev_del;
+ 	}
+ 
++	ret = ath11k_nss_vif_add(ar, arvif);
++	if (ret)
++		ath11k_warn(ab, "NSS vif add failed, continuing without NSS offload\n");
++
+ 	mutex_unlock(&ar->conf_mutex);
+ 
+ 	return 0;
+@@ -6085,6 +6089,8 @@ static void ath11k_mac_op_remove_interfa
+ 	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
+ 	struct ath11k_base *ab = ar->ab;
+ 
++	ath11k_nss_vif_del(ar, arvif);
++
+ 	mutex_lock(&ar->conf_mutex);
+ 
+ 	ath11k_dbg(ab, ATH11K_DBG_MAC, "mac remove interface (vdev %d)\n",
