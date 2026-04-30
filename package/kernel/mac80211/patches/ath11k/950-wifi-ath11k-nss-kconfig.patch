@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: OpenWrt Developer <developer@openwrt.org>
+Date: Mon, 30 Apr 2025 15:00:00 +0000
+Subject: [PATCH] wifi: ath11k: add ATH11K_NSS Kconfig option for NSS WiFi offload
+
+Add a new Kconfig symbol ATH11K_NSS that controls whether the NSS (Network
+Subsystem) WiFi offload integration is compiled into the ath11k driver.
+This enables routing WiFi frames through the Qualcomm NSS hardware
+accelerator on IPQ5018/IPQ60xx/IPQ807x platforms, reducing CPU load.
+
+When enabled, ath11k compiles in nss.c which provides the interface
+between ath11k and the qca-nss-clients wifili module.
+
+Signed-off-by: OpenWrt Developer <developer@openwrt.org>
+---
+ drivers/net/wireless/ath/ath11k/Kconfig  | 14 ++++++++++++++
+ drivers/net/wireless/ath/ath11k/Makefile |  1 +
+ local-symbols                            |  1 +
+ 3 files changed, 16 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath11k/Kconfig
++++ b/drivers/net/wireless/ath/ath11k/Kconfig
+@@ -68,3 +68,17 @@ config ATH11K_THERMAL
+ 	depends on THERMAL
+ 	help
+ 	  Enable ath11k thermal sensors and throttling support.
++
++config ATH11K_NSS
++	bool "ath11k NSS WiFi offload support"
++	depends on ATH11K_AHB
++	default n
++	help
++	  Enable NSS (Network Subsystem) WiFi offload for ath11k on Qualcomm
++	  IPQ5018/IPQ60xx/IPQ807x platforms.
++
++	  When enabled, WiFi frames are processed by the dedicated NSS hardware
++	  accelerator cores instead of the main ARM cores, reducing CPU load
++	  and improving throughput.
++
++	  Requires qca-nss-drv and qca-nss-clients (nss_wifili) kernel modules
++	  to be loaded at runtime.
++
++	  If unsure, say N.
+--- a/drivers/net/wireless/ath/ath11k/Makefile
++++ b/drivers/net/wireless/ath/ath11k/Makefile
+@@ -24,6 +24,7 @@ ath11k-y += core.o \
+ ath11k-$(CPTCFG_ATH11K_DEBUGFS) += debugfs.o debugfs_htt_stats.o debugfs_sta.o
+ ath11k-$(CPTCFG_NL80211_TESTMODE) += testmode.o
+ ath11k-$(CPTCFG_ATH11K_TRACING) += trace.o
++ath11k-$(CPTCFG_ATH11K_NSS) += nss.o
+ ath11k-$(CPTCFG_ATH11K_THERMAL) += thermal.o
+ ath11k-$(CPTCFG_ATH11K_SPECTRAL) += spectral.o
+ ath11k-$(CONFIG_PM) += wow.o
+--- a/local-symbols
++++ b/local-symbols
+@@ -165,6 +165,7 @@ ATH11K_TRACING=
+ ATH11K_SPECTRAL=
+ ATH11K_THERMAL=
++ATH11K_NSS=
+ ATH12K=
+ ATH12K_AHB=
+ ATH12K_DEBUG=
+

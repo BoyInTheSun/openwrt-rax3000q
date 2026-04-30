@@ -334,6 +334,14 @@ define KernelPackage/ath11k/config
                depends on PACKAGE_kmod-ath11k
                default y if TARGET_qualcommax
 
+       config ATH11K_NSS
+               bool "Enable NSS WiFi offload support"
+               depends on PACKAGE_kmod-ath11k-ahb
+               default y if TARGET_qualcommax
+               help
+                 Enable NSS WiFi offload for ath11k on Qualcomm IPQ50xx/IPQ60xx/IPQ807x.
+                 Requires kmod-qca-nss-drv and kmod-qca-nss-clients to be installed.
+
 endef
 
 define KernelPackage/ath11k-ahb
